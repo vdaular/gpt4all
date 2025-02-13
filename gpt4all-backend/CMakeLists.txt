@@ -1,4 +1,7 @@
-cmake_minimum_required(VERSION 3.21)  # for PROJECT_IS_TOP_LEVEL
+cmake_minimum_required(VERSION 3.23)  # for FILE_SET
+
+include(../common/common.cmake)
+
 set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -33,7 +36,7 @@ set(LLMODEL_VERSION_PATCH 0)
 set(LLMODEL_VERSION "${LLMODEL_VERSION_MAJOR}.${LLMODEL_VERSION_MINOR}.${LLMODEL_VERSION_PATCH}")
 project(llmodel VERSION ${LLMODEL_VERSION} LANGUAGES CXX C)
 
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY})
 set(BUILD_SHARED_LIBS ON)
@@ -47,17 +50,15 @@ else()
     message(STATUS "Interprocedural optimization support detected")
 endif()
 
-set(DIRECTORY llama.cpp-mainline)
+set(DIRECTORY deps/llama.cpp-mainline)
 include(llama.cpp.cmake)
 
 set(BUILD_VARIANTS)
-set(GPTJ_BUILD_VARIANT cpu)
 if (APPLE)
     list(APPEND BUILD_VARIANTS metal)
 endif()
 if (LLMODEL_KOMPUTE)
     list(APPEND BUILD_VARIANTS kompute kompute-avxonly)
-    set(GPTJ_BUILD_VARIANT kompute)
 else()
     list(PREPEND BUILD_VARIANTS cpu cpu-avxonly)
 endif()
@@ -65,6 +66,24 @@ if (LLMODEL_VULKAN)
     list(APPEND BUILD_VARIANTS vulkan vulkan-avxonly)
 endif()
 if (LLMODEL_CUDA)
+    cmake_minimum_required(VERSION 3.18)  # for CMAKE_CUDA_ARCHITECTURES
+
+    # Defaults must be set before enable_language(CUDA).
+    # Keep this in sync with the arch list in ggml/src/CMakeLists.txt.
+    if (NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        # 52 == lowest CUDA 12 standard
+        # 60 == f16 CUDA intrinsics
+        # 61 == integer CUDA intrinsics
+        # 70 == compute capability at which unrolling a loop in mul_mat_q kernels is faster
+        if (GGML_CUDA_F16 OR GGML_CUDA_DMMV_F16)
+            set(CMAKE_CUDA_ARCHITECTURES "60;61;70;75") # needed for f16 CUDA intrinsics
+        else()
+            set(CMAKE_CUDA_ARCHITECTURES "52;61;70;75") # lowest CUDA 12 standard + lowest for integer intrinsics
+            #set(CMAKE_CUDA_ARCHITECTURES "OFF") # use this to compile much faster, but only F16 models work
+        endif()
+    endif()
+    message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
+
     include(CheckLanguage)
     check_language(CUDA)
     if (NOT CMAKE_CUDA_COMPILER)
@@ -78,8 +97,6 @@ if (LLMODEL_ROCM)
     list(APPEND BUILD_VARIANTS rocm rocm-avxonly)
 endif()
 
-set(CMAKE_VERBOSE_MAKEFILE ON)
-
 # Go through each build variant
 foreach(BUILD_VARIANT IN LISTS BUILD_VARIANTS)
     # Determine flags
@@ -88,29 +105,33 @@ foreach(BUILD_VARIANT IN LISTS BUILD_VARIANTS)
     else()
         set(GPT4ALL_ALLOW_NON_AVX ON)
     endif()
-    set(LLAMA_AVX2 ${GPT4ALL_ALLOW_NON_AVX})
-    set(LLAMA_F16C ${GPT4ALL_ALLOW_NON_AVX})
-    set(LLAMA_FMA  ${GPT4ALL_ALLOW_NON_AVX})
+    set(GGML_AVX2 ${GPT4ALL_ALLOW_NON_AVX})
+    set(GGML_F16C ${GPT4ALL_ALLOW_NON_AVX})
+    set(GGML_FMA  ${GPT4ALL_ALLOW_NON_AVX})
 
-    set(LLAMA_METAL   OFF)
-    set(LLAMA_KOMPUTE OFF)
-    set(LLAMA_VULKAN  OFF)
-    set(LLAMA_CUDA    OFF)
-    set(LLAMA_ROCM    OFF)
+    set(GGML_METAL   OFF)
+    set(GGML_KOMPUTE OFF)
+    set(GGML_VULKAN  OFF)
+    set(GGML_CUDA    OFF)
+    set(GGML_ROCM    OFF)
     if (BUILD_VARIANT MATCHES metal)
-        set(LLAMA_METAL   ON)
+        set(GGML_METAL   ON)
     elseif (BUILD_VARIANT MATCHES kompute)
-        set(LLAMA_KOMPUTE ON)
+        set(GGML_KOMPUTE ON)
     elseif (BUILD_VARIANT MATCHES vulkan)
-        set(LLAMA_VULKAN  ON)
+        set(GGML_VULKAN  ON)
     elseif (BUILD_VARIANT MATCHES cuda)
-        set(LLAMA_CUDA    ON)
+        set(GGML_CUDA    ON)
     elseif (BUILD_VARIANT MATCHES rocm)
-        set(LLAMA_HIPBLAS ON)
+        set(GGML_HIPBLAS ON)
     endif()
 
     # Include GGML
     include_ggml(-mainline-${BUILD_VARIANT})
+
+    if (BUILD_VARIANT MATCHES metal)
+        set(GGML_METALLIB "${GGML_METALLIB}" PARENT_SCOPE)
+    endif()
 
     # Function for preparing individual implementations
     function(prepare_target TARGET_NAME BASE_LIB)
@@ -130,16 +151,14 @@ foreach(BUILD_VARIANT IN LISTS BUILD_VARIANTS)
 
     # Add each individual implementations
     add_library(llamamodel-mainline-${BUILD_VARIANT} SHARED
-        llamamodel.cpp llmodel_shared.cpp)
+        src/llamamodel.cpp src/llmodel_shared.cpp)
+    gpt4all_add_warning_options(llamamodel-mainline-${BUILD_VARIANT})
     target_compile_definitions(llamamodel-mainline-${BUILD_VARIANT} PRIVATE
         LLAMA_VERSIONS=>=3 LLAMA_DATE=999999)
+    target_include_directories(llamamodel-mainline-${BUILD_VARIANT} PRIVATE
+        src include/gpt4all-backend
+    )
     prepare_target(llamamodel-mainline llama-mainline)
-
-    if (BUILD_VARIANT MATCHES ${GPTJ_BUILD_VARIANT})
-        add_library(gptj-${BUILD_VARIANT} SHARED
-            gptj.cpp utils.h utils.cpp llmodel_shared.cpp llmodel_shared.h)
-        prepare_target(gptj llama-mainline)
-    endif()
 
     if (NOT PROJECT_IS_TOP_LEVEL AND BUILD_VARIANT STREQUAL cuda)
         set(CUDAToolkit_BIN_DIR ${CUDAToolkit_BIN_DIR} PARENT_SCOPE)
@@ -147,11 +166,20 @@ foreach(BUILD_VARIANT IN LISTS BUILD_VARIANTS)
 endforeach()
 
 add_library(llmodel
-    llmodel.h llmodel.cpp llmodel_shared.cpp
-    llmodel_c.h llmodel_c.cpp
-    dlhandle.cpp
+    src/dlhandle.cpp
+    src/llmodel.cpp
+    src/llmodel_c.cpp
+    src/llmodel_shared.cpp
+)
+gpt4all_add_warning_options(llmodel)
+target_sources(llmodel PUBLIC
+    FILE_SET public_headers TYPE HEADERS BASE_DIRS include
+    FILES include/gpt4all-backend/llmodel.h
+          include/gpt4all-backend/llmodel_c.h
+          include/gpt4all-backend/sysinfo.h
 )
 target_compile_definitions(llmodel PRIVATE LIB_FILE_EXT="${CMAKE_SHARED_LIBRARY_SUFFIX}")
+target_include_directories(llmodel PRIVATE src include/gpt4all-backend)
 
 set_target_properties(llmodel PROPERTIES
                               VERSION ${PROJECT_VERSION}
